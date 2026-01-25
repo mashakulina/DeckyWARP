@@ -76,11 +76,12 @@ WARP лучше всего работает совместно с [Zapret DPI Ma
 ㅤ
 
 # Screenshots/Скриншоты
-![screenshot](https://i.ibb.co/svjVq2Jz/IMG-20250524-161456-971.jpg)
-![screenshot](https://i.ibb.co/Vk2wrrR/IMG-20250524-161611-262.jpg)
-![screenshot](https://i.ibb.co/20YZLXvJ/IMG-20250524-161626-108.jpg)
-![screenshot](https://i.ibb.co/przVbcGn/IMG-20250524-161706-642.jpg)
-![screenshot](https://i.ibb.co/0yVK9cKf/IMG-20250524-161641-259.jpg)
-![screenshot](https://i.ibb.co/GQTGKM8y/IMG-20250524-161654-538.jpg)
-
-
+![screenshot](https://i.ibb.co/M56xtTtW/20260125143122-1.jpg)
+![screenshot](https://i.ibb.co/pvLgC565/20260125143139-1.jpg)
+![screenshot](https://i.ibb.co/0Vyrr8B2/20260125133338-1.jpg)
+![screenshot](https://i.ibb.co/LDJtG04P/20260125141615-1.jpg)
+![screenshot](https://i.ibb.co/wNb7kKb7/20260125141626-1.jpg)
+![screenshot](https://i.ibb.co/gkj1F3g/20260125141853-1.jpg)
+![screenshot](https://i.ibb.co/Wvcc3GFM/20260125141540-1.jpg)
+![screenshot](https://i.ibb.co/KxSyJ5r3/20260125141548-1.jpg)
+![screenshot](https://i.ibb.co/dspr9dDW/20260125141556-1.jpg)

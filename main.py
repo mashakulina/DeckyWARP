@@ -190,7 +190,7 @@ if [ -f "$PACMAN_DB_LOCK" ]; then
     sudo rm -f "$PACMAN_DB_LOCK"
     echo "Lock file removed."
 fi
-steamos-readonly status | grep -q disabled || echo y | steamos-readonly disable
+steamos-readonly status | grep -q disabled  echo y | steamos-readonly disable
 mount -o remount,rw /
 rm -rf /etc/pacman.d/gnupg
 install -dm700 /etc/pacman.d/gnupg
@@ -202,8 +202,14 @@ pacman-key --lsign-key 3056513887B78AEB
 pacman -U --noconfirm \
   'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' \
   'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst'
-grep -q '\[chaotic-aur\]' /etc/pacman.conf || \
+grep -q '\[chaotic-aur\]' /etc/pacman.conf  \
   echo -e '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist' >> /etc/pacman.conf
+cd /tmp
+echo "Downloading libgcc package..."
+wget https://mirror.yandex.ru/archlinux/core/os/x86_64/libgcc-15.2.1+r604+g0b99615a8aef-1-x86_64.pkg.tar.zst
+echo "Installing libgcc package..."
+pacman -U --noconfirm --overwrite='*' libgcc-15.2.1+r604+g0b99615a8aef-1-x86_64.pkg.tar.zst
+echo "libgcc installation complete."
 pacman -Sy --noconfirm cloudflare-warp-bin
 /usr/bin/warp-cli --accept-tos
 /usr/bin/warp-cli registration new

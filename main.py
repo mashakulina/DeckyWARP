@@ -99,12 +99,116 @@ def _force_cleanup_update_flag():
         UPD_FLAG.unlink(missing_ok=True)
 
 
+def _update_unit_active():
+    for unit in (UPD_UNIT, f"{UPD_UNIT}_sudo"):
+        if _unit_state(unit) in ("active", "activating"):
+            return unit
+    return None
+
+
+def _update_log_in_progress():
+    if not UPD_LOG.exists():
+        return False
+    try:
+        log = UPD_LOG.read_text()
+    except Exception:
+        return False
+    if "== START UPDATE:" not in log:
+        return False
+    tail = log.split("== START UPDATE:")[-1]
+    if "== DONE:" in tail or "ALREADY UP TO DATE" in tail:
+        return False
+    return True
+
+
+def _update_is_running():
+    return _update_unit_active() is not None or _update_log_in_progress()
+
+
+def _read_update_log_text():
+    if not UPD_LOG.exists():
+        return ""
+    try:
+        lines = UPD_LOG.read_text().splitlines()
+    except Exception:
+        return ""
+
+    meaningful = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        if (
+            s.startswith("== ")
+            or s.startswith("ERROR:")
+            or s.startswith("Current:")
+            or s.startswith("Asset URL:")
+            or s.startswith("Downloaded zip:")
+            or s.startswith("Found unpacked")
+            or s.startswith("Plugin dir:")
+        ):
+            meaningful.append(s)
+            continue
+        if "Dload" in s and "Upload" in s and "Total" in s:
+            continue
+        if s.startswith("curl:"):
+            continue
+        if len(s) > 0 and s[0].isdigit() and ("--:--:--" in s or "speed" in s.lower()):
+            continue
+    return "\n".join(meaningful[-50:])
+
+
+def _parse_update_progress(log: str):
+    stages = [
+        ("done", 100, ["== DONE:", "ALREADY UP TO DATE"]),
+        ("restart", 90, ["== RESTARTING DECKY =="]),
+        ("install", 65, ["== INSTALLING FILES ==", "== COPYING PLUGIN ==", "== UNZIPPING =="]),
+        ("download", 40, ["Downloaded zip:", "== DOWNLOADING ZIP =="]),
+        ("fetch", 15, ["== FETCHING ASSET URL ==", "== START UPDATE:", "== UPDATE REQUESTED"]),
+    ]
+
+    best_id, best_percent, best_idx = "fetch", 5, -1
+    for stage_id, percent, markers in stages:
+        for marker in markers:
+            idx = log.rfind(marker)
+            if idx > best_idx:
+                best_idx = idx
+                best_id, best_percent = stage_id, percent
+
+    progress_markers = [
+        "== RESTARTING DECKY ==",
+        "== INSTALLING FILES ==",
+        "== UNZIPPING ==",
+        "== DOWNLOADING ZIP ==",
+        "== FETCHING ASSET URL ==",
+        "== START UPDATE:",
+    ]
+    last_progress = -1
+    for marker in progress_markers:
+        idx = log.rfind(marker)
+        if idx > last_progress:
+            last_progress = idx
+    failed = "ERROR:" in log and "== DONE:" not in log and log.rfind("ERROR:") > last_progress
+
+    done = "== DONE:" in log or "ALREADY UP TO DATE" in log
+    return {
+        "step": best_id,
+        "percent": best_percent,
+        "done": done,
+        "failed": failed,
+    }
+
+
 def _parse_check_log():
     if not CHK_LOG.exists():
         return None
     try:
         lines = CHK_LOG.read_text().splitlines()
-        for line in reversed(lines):
+        start_idx = 0
+        for i, line in enumerate(lines):
+            if line.startswith("== START CHECK:") or line.startswith("== CHECK REQUESTED:"):
+                start_idx = i
+        for line in reversed(lines[start_idx:]):
             if line.startswith("update_available"):
                 parts = line.strip().split()
                 if len(parts) == 3:
@@ -172,6 +276,8 @@ def _fetch_changelog():
 
 async def _wait_for_check_result(timeout=45):
     deadline = time.time() + timeout
+    unit_done_at = None
+    seen_active = False
     while time.time() < deadline:
         parsed = _parse_check_log()
         if parsed:
@@ -179,14 +285,21 @@ async def _wait_for_check_result(timeout=45):
                 parsed["changelog"] = await asyncio.to_thread(_fetch_changelog)
             return parsed
 
-        unit_state = _unit_state(CHK_UNIT)
-        if unit_state in ("inactive", "failed", "dead"):
-            parsed = _parse_check_log()
-            if parsed:
-                if parsed["status"] == "update_available":
-                    parsed["changelog"] = await asyncio.to_thread(_fetch_changelog)
-                return parsed
-            break
+        main_state = _unit_state(CHK_UNIT)
+        sudo_state = _unit_state(f"{CHK_UNIT}_sudo")
+        if main_state in ("active", "activating") or sudo_state in ("active", "activating"):
+            seen_active = True
+            unit_done_at = None
+        elif seen_active:
+            if unit_done_at is None:
+                unit_done_at = time.time()
+            elif time.time() - unit_done_at > 2:
+                parsed = _parse_check_log()
+                if parsed:
+                    if parsed["status"] == "update_available":
+                        parsed["changelog"] = await asyncio.to_thread(_fetch_changelog)
+                    return parsed
+                break
 
         await asyncio.sleep(0.5)
 
@@ -558,8 +671,7 @@ RELEASE_JSON="/tmp/deckywarp_release.json"
 
 exec 200>"$LOCK"
 if ! flock -n 200; then
-  echo "ERROR: another update is already running" >> "$LOG"
-  exit 1
+  exit 0
 fi
 
 exec >> "$LOG" 2>&1
@@ -604,7 +716,7 @@ fi
 echo "Asset URL: $ASSET_URL"
 
 echo "== DOWNLOADING ZIP =="
-curl -fsSL --connect-timeout 45 --retry 3 --retry-delay 2 -o latest.zip "$ASSET_URL"
+curl -fsSL --connect-timeout 45 --retry 3 --retry-delay 2 -o latest.zip "$ASSET_URL" 2>/dev/null
 [ ! -f latest.zip ] && echo "ERROR: download failed" && exit 1
 echo "Downloaded zip: $(du -h latest.zip)"
 
@@ -813,13 +925,18 @@ class Plugin:
         """Запускает обновление плагина через systemd unit (переживает restart Decky)."""
         _force_cleanup_update_flag()
 
-        for unit in (UPD_UNIT, f"{UPD_UNIT}_sudo"):
-            if _unit_state(unit) in ("active", "activating"):
-                return {"status": "error", "detail": "Update already running"}
+        active = _update_unit_active()
+        if active:
+            return {"status": "started", "detail": active}
+
+        if _update_log_in_progress():
+            return {"status": "started", "detail": "log in progress"}
 
         try:
             UPD_FLAG.open("x").close()
         except FileExistsError:
+            if _update_is_running():
+                return {"status": "started", "detail": "already running"}
             _force_cleanup_update_flag()
             if UPD_FLAG.exists():
                 return {"status": "error", "detail": "Update already running"}
@@ -827,26 +944,23 @@ class Plugin:
         script = _write_update_script()
         UPD_LOG.write_text(f"== UPDATE REQUESTED: {time.ctime()} ==\n")
 
-        await _run("systemctl", "reset-failed", f"{UPD_UNIT}.service")
-        await _run("systemctl", "stop", f"{UPD_UNIT}.service")
-        await _run("systemctl", "reset-failed", f"{UPD_UNIT}_sudo.service")
-        await _run("systemctl", "stop", f"{UPD_UNIT}_sudo.service")
+        launch_plan = [
+            (UPD_UNIT, ["systemd-run", "--unit", UPD_UNIT, "--service-type=oneshot", "/bin/bash", script]),
+            (f"{UPD_UNIT}_sudo", ["sudo", "systemd-run", "--unit", f"{UPD_UNIT}_sudo", "--service-type=oneshot", "/bin/bash", script]),
+        ]
 
-        unit = UPD_UNIT
-        cmd = ["systemd-run", "--unit", UPD_UNIT, "--service-type=oneshot", "/bin/bash", script]
-        result = await asyncio.to_thread(
-            subprocess.run,
-            cmd,
-            capture_output=True,
-            text=True,
-            env=_clean_env(),
-        )
+        last_error = "systemd-run failed"
+        launched_unit = None
 
-        if result.returncode != 0:
-            unit = f"{UPD_UNIT}_sudo"
-            cmd = ["sudo", "systemd-run", "--unit", unit, "--service-type=oneshot", "/bin/bash", script]
+        for unit, cmd in launch_plan:
+            active = _update_unit_active()
+            if active:
+                launched_unit = active
+                break
+
             await _run("systemctl", "reset-failed", f"{unit}.service")
             await _run("systemctl", "stop", f"{unit}.service")
+
             result = await asyncio.to_thread(
                 subprocess.run,
                 cmd,
@@ -855,29 +969,41 @@ class Plugin:
                 env=_clean_env(),
             )
 
-        if result.returncode != 0:
-            UPD_FLAG.unlink(missing_ok=True)
-            last_error = (result.stderr or result.stdout or "systemd-run failed").strip()
-            log_to_file(f"Update launch failed: {last_error}")
-            with UPD_LOG.open("a", encoding="utf-8") as f:
-                f.write(f"ERROR: launch failed: {last_error}\n")
-            return {"status": "error", "detail": last_error[:200]}
+            await asyncio.sleep(0.5)
+            state = _unit_state(unit)
 
-        await asyncio.sleep(0.5)
-        state = _unit_state(unit)
+            if result.returncode == 0 or state in ("active", "activating"):
+                launched_unit = unit
+                break
+
+            if _update_log_in_progress():
+                launched_unit = unit
+                break
+
+            last_error = (result.stderr or result.stdout or "systemd-run failed").strip()
+            log_to_file(f"Update launch failed ({unit}): {last_error}")
+
+        if launched_unit or _update_is_running():
+            unit = launched_unit or _update_unit_active() or UPD_UNIT
+            state = _unit_state(unit)
+            with UPD_LOG.open("a", encoding="utf-8") as f:
+                f.write(f"== LAUNCHED via {unit} (state={state}) ==\n")
+            log_to_file(f"Update started via {unit}, state={state}")
+            return {"status": "started", "detail": state}
+
+        UPD_FLAG.unlink(missing_ok=True)
         with UPD_LOG.open("a", encoding="utf-8") as f:
-            f.write(f"== LAUNCHED via {unit} (state={state}) ==\n")
-        log_to_file(f"Update started via {unit}, state={state}")
-        return {"status": "started", "detail": state}
+            f.write(f"ERROR: launch failed: {last_error}\n")
+        return {"status": "error", "detail": last_error[:200]}
 
     async def get_update_log(self):
-        if UPD_LOG.exists():
-            try:
-                lines = UPD_LOG.read_text().splitlines()
-                return "\n".join(lines[-20:])
-            except Exception:
-                pass
-        return ""
+        return _read_update_log_text()
+
+    async def get_update_progress(self):
+        log = _read_update_log_text()
+        progress = _parse_update_progress(log)
+        progress["log"] = log
+        return progress
 
     async def get_version(self):
         plugin_json = _plugin_dir() / "plugin.json"
@@ -895,82 +1021,64 @@ class Plugin:
     async def check_update(self):
         """Проверить доступность новой версии через отдельный systemd unit."""
         _cleanup_flag(CHK_FLAG, CHK_UNIT)
-        if _busy(CHK_FLAG):
+
+        if _busy(CHK_FLAG) and _unit_state(CHK_UNIT) in ("active", "activating"):
+            parsed = await _wait_for_check_result(timeout=30)
+            CHK_FLAG.unlink(missing_ok=True)
+            if parsed:
+                return parsed
             return {"status": "checking"}
-        CHK_FLAG.touch()
-        await _run(
-            "systemd-run", "--unit", CHK_UNIT,
-            "--service-type=oneshot", "--quiet",
-            _write_check_script(),
+
+        if _busy(CHK_FLAG):
+            CHK_FLAG.unlink(missing_ok=True)
+
+        try:
+            CHK_FLAG.open("x").close()
+        except FileExistsError:
+            parsed = await _wait_for_check_result(timeout=30)
+            CHK_FLAG.unlink(missing_ok=True)
+            if parsed:
+                return parsed
+            return {"status": "checking"}
+
+        script = _write_check_script()
+        CHK_LOG.write_text(f"== CHECK REQUESTED: {time.ctime()} ==\n")
+
+        await _run("systemctl", "reset-failed", f"{CHK_UNIT}.service")
+        await _run("systemctl", "stop", f"{CHK_UNIT}.service")
+
+        cmd = ["systemd-run", "--unit", CHK_UNIT, "--service-type=oneshot", "/bin/bash", script]
+        result = await asyncio.to_thread(
+            subprocess.run,
+            cmd,
+            capture_output=True,
+            text=True,
+            env=_clean_env(),
         )
-        await asyncio.sleep(1)
 
-        def _fetch_changelog():
-            import urllib.request
-            import ssl
-            import json
-            try:
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
+        if result.returncode != 0:
+            sudo_unit = f"{CHK_UNIT}_sudo"
+            await _run("systemctl", "reset-failed", f"{sudo_unit}.service")
+            await _run("systemctl", "stop", f"{sudo_unit}.service")
+            cmd = ["sudo", "systemd-run", "--unit", sudo_unit, "--service-type=oneshot", "/bin/bash", script]
+            result = await asyncio.to_thread(
+                subprocess.run,
+                cmd,
+                capture_output=True,
+                text=True,
+                env=_clean_env(),
+            )
 
-                with urllib.request.urlopen("https://api.github.com/repos/mashakulina/DeckyWARP/releases/latest", context=ctx) as resp:
-                    data = json.load(resp)
-                    body = data.get("body", "")
-                    lines = body.splitlines()
+        if result.returncode != 0:
+            CHK_FLAG.unlink(missing_ok=True)
+            detail = (result.stderr or result.stdout or "systemd-run failed").strip()
+            return {"status": "error", "detail": detail[:200]}
 
-                en_lines, ru_lines = [], []
-                mode = 0  # 0 = none, 1 = EN, 2 = RU
-
-                for line in lines:
-                    if line.strip().startswith("## **Changelog**"):
-                        mode = 1
-                        continue
-                    elif line.strip().startswith("## **Список изменений**"):
-                        mode = 2
-                        continue
-                    elif line.strip().startswith("#"):
-                        mode = 0
-                        continue
-
-                    if mode == 1:
-                        en_lines.append(line)
-                    elif mode == 2:
-                        ru_lines.append(line)
-
-                result = ""
-                if en_lines:
-                    result += "== EN ==\n" + "\n".join(en_lines).strip() + "\n"
-                if ru_lines:
-                    result += "\n== RU ==\n" + "\n".join(ru_lines).strip()
-                return result or "[changelog empty]"
-            except Exception as e:
-                return f"[changelog error] {e}"
-
-        if CHK_LOG.exists():
-            try:
-                lines = CHK_LOG.read_text().splitlines()
-                for line in reversed(lines):
-                    if line.startswith("update_available"):
-                        parts = line.strip().split()
-                        if len(parts) == 3:
-                            return {
-                                "status": "update_available",
-                                "latest": parts[1],
-                                "current": parts[2],
-                                "changelog": _fetch_changelog()
-                            }
-                    elif line.startswith("up_to_date"):
-                        parts = line.strip().split()
-                        if len(parts) == 2:
-                            return {
-                                "status": "up_to_date",
-                                "current": parts[1]
-                            }
-                return {"status": "error", "detail": "no update info in log"}
-            except Exception as e:
-                return {"status": "error", "detail": str(e)}
-        return {"status": "error", "detail": "log not found"}
+        parsed = await _wait_for_check_result(timeout=45)
+        CHK_FLAG.unlink(missing_ok=True)
+        if parsed:
+            return parsed
+        return {"status": "error", "detail": "check timed out"}
 
     # ---------- MISC -----------------------------------------------------
 

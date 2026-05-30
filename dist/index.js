@@ -288,20 +288,84 @@
         };
         return dict[key] || key;
     };
-    const parseUpdateStep = (log) => {
-        if (log.includes("ERROR:"))
-            return t$1("update_step_error");
+    const isUpdateLogFailed = (log) => {
+        if (!log.includes("ERROR:"))
+            return false;
         if (log.includes("== DONE:") || log.includes("ALREADY UP TO DATE"))
-            return t$1("update_step_done");
-        if (log.includes("== RESTARTING DECKY =="))
-            return t$1("update_step_restart");
-        if (log.includes("== INSTALLING FILES ==") || log.includes("== COPYING PLUGIN ==") || log.includes("== UNZIPPING =="))
-            return t$1("update_step_install");
-        if (log.includes("== DOWNLOADING ZIP =="))
-            return t$1("update_step_download");
-        if (log.includes("== FETCHING ASSET URL ==") || log.includes("== START UPDATE:"))
-            return t$1("update_step_fetch");
-        return t$1("update_in_progress");
+            return false;
+        const markers = [
+            "== RESTARTING DECKY ==",
+            "== INSTALLING FILES ==",
+            "== UNZIPPING ==",
+            "== DOWNLOADING ZIP ==",
+            "== FETCHING ASSET URL ==",
+            "== START UPDATE:",
+        ];
+        let lastProgress = -1;
+        for (const marker of markers) {
+            const idx = log.lastIndexOf(marker);
+            if (idx > lastProgress)
+                lastProgress = idx;
+        }
+        return log.lastIndexOf("ERROR:") > lastProgress;
+    };
+    const UPDATE_STAGE_MARKERS = [
+        { id: "done", percent: 100, markers: ["== DONE:", "ALREADY UP TO DATE"] },
+        { id: "restart", percent: 90, markers: ["== RESTARTING DECKY =="] },
+        { id: "install", percent: 65, markers: ["== INSTALLING FILES ==", "== COPYING PLUGIN ==", "== UNZIPPING =="] },
+        { id: "download", percent: 40, markers: ["Downloaded zip:", "== DOWNLOADING ZIP =="] },
+        { id: "fetch", percent: 15, markers: ["== FETCHING ASSET URL ==", "== START UPDATE:", "== UPDATE REQUESTED"] },
+    ];
+    const getUpdateStepFromLog = (log) => {
+        if (isUpdateLogFailed(log))
+            return { id: "error", percent: 0 };
+        let best = { id: "fetch", percent: 5 };
+        let bestIdx = -1;
+        for (const stage of UPDATE_STAGE_MARKERS) {
+            for (const marker of stage.markers) {
+                const idx = log.lastIndexOf(marker);
+                if (idx > bestIdx) {
+                    bestIdx = idx;
+                    best = { id: stage.id, percent: stage.percent };
+                }
+            }
+        }
+        return best;
+    };
+    const applyUpdateProgressResult = (result) => {
+        if (!result)
+            return null;
+        if (typeof result === "string") {
+            const step = getUpdateStepFromLog(result);
+            return {
+                step: step.id,
+                percent: step.percent,
+                log: result,
+                done: result.includes("== DONE:") || result.includes("ALREADY UP TO DATE"),
+                failed: isUpdateLogFailed(result),
+            };
+        }
+        return {
+            step: result.step || "fetch",
+            percent: result.percent ?? 5,
+            log: result.log || "",
+            done: !!result.done,
+            failed: !!result.failed,
+        };
+    };
+    const UpdateProgressBar = ({ percent = 0, error = false, indeterminate = false }) => {
+        const fillColor = error ? "rgb(198, 74, 74)" : "rgb(26, 159, 255)";
+        return (window.SP_REACT.createElement("div", { style: { width: "100%", padding: "4px 0" } },
+                                              window.SP_REACT.createElement("div", { style: { width: "100%", height: "6px", borderRadius: "3px", backgroundColor: "rgb(43, 51, 55)", overflow: "hidden" } },
+                                                                                window.SP_REACT.createElement("div", { style: {
+                                                                                    height: "100%",
+                                                                                    width: indeterminate ? "35%" : `${Math.max(0, Math.min(100, percent))}%`,
+                                                                                    borderRadius: "3px",
+                                                                                    backgroundColor: fillColor,
+                                                                                    transition: indeterminate ? "none" : "width 0.4s ease",
+                                                                                    animation: indeterminate ? "deckywarp-progress-indeterminate 1.2s ease-in-out infinite" : undefined
+                                                                                } })),
+                                              window.SP_REACT.createElement("style", null, `@keyframes deckywarp-progress-indeterminate { 0% { margin-left: 0; } 50% { margin-left: 65%; } 100% { margin-left: 0; } }`)));
     };
     const Updates = ({ serverAPI }) => {
         const [autoCheck, setAutoCheck] = React.useState(false);
@@ -311,14 +375,59 @@
         const [latestVersion, setLatestVersion] = React.useState(null);
         const [changelog, setChangelog] = React.useState(null);
         const [debugMode, setDebugMode] = React.useState(false);
-        const [isUpdating, setIsUpdating] = React.useState(false);
+        const [isUpdating, setIsUpdating] = React.useState(localStorage.getItem("update_in_progress") === "true");
         const [isChecking, setIsChecking] = React.useState(false);
-        const [updateProgress, setUpdateProgress] = React.useState(null);
+        const [updateHasError, setUpdateHasError] = React.useState(false);
         const [isUpdateLocked, setIsUpdateLocked] = React.useState(localStorage.getItem("update_in_progress") === "true");
         const IGNORED_KEY = "update_ignored_version";
-        React.useEffect(() => {
+        const checkingRef = React.useRef(false);
+        const finishUpdateSuccess = async () => {
             localStorage.removeItem("update_in_progress");
+            setIsUpdating(false);
             setIsUpdateLocked(false);
+            setStatus("up_to_date");
+            setLatestVersion(null);
+            setChangelog(null);
+            localStorage.setItem("update_status", "up_to_date");
+            localStorage.removeItem("update_latest");
+            localStorage.removeItem("update_changelog");
+            try {
+                const ver = await window.call("get_version", {});
+                if (ver?.version)
+                    setCurrentVersion(ver.version);
+            }
+            catch (_) { }
+            serverAPI.toaster.toast({ title: "DeckyWARP", body: t$1("update_step_done") });
+        };
+        const clearUpdateProgress = () => {
+            localStorage.removeItem("update_in_progress");
+            setIsUpdating(false);
+            setIsUpdateLocked(false);
+        };
+        const applyProgressFromBackend = async (raw) => {
+            let data = raw;
+            if (data === undefined) {
+                try {
+                    data = await window.call("get_update_progress", {});
+                }
+                catch (_) {
+                    try {
+                        data = await window.call("get_update_log", {});
+                    }
+                    catch (_) {
+                        data = null;
+                    }
+                }
+            }
+            const progress = applyUpdateProgressResult(data);
+            if (!progress)
+                return null;
+            setUpdateHasError(progress.failed);
+            if (progress.log)
+                setLog(progress.log);
+            return progress;
+        };
+        React.useEffect(() => {
             const storedDebug = localStorage.getItem("debug_mode");
             if (storedDebug !== null)
                 setDebugMode(storedDebug === "true");
@@ -328,6 +437,7 @@
             const storedLatest = localStorage.getItem("update_latest");
             const storedCurrent = localStorage.getItem("update_current");
             const storedChangelog = localStorage.getItem("update_changelog");
+            const inProgress = localStorage.getItem("update_in_progress") === "true";
             if (storedStatus)
                 setStatus(storedStatus);
             if (storedLatest)
@@ -337,14 +447,19 @@
             if (storedStatus === "update_available" && storedChangelog) {
                 setChangelog(storedChangelog);
             }
+            if (inProgress) {
+                setIsUpdating(true);
+                setIsUpdateLocked(true);
+            }
             (async () => {
                 try {
                     const result = await window.call("get_version", {});
                     setCurrentVersion(result.version);
-                    const storedLatestAfter = localStorage.getItem("update_latest");
+                    const storedLatestVer = localStorage.getItem("update_latest");
                     if (storedStatus === "update_available" &&
-                        storedLatestAfter &&
-                        result.version === storedLatestAfter) {
+                        storedLatestVer &&
+                        result.version === storedLatestVer &&
+                        !inProgress) {
                         setStatus("up_to_date");
                         setLatestVersion(null);
                         setChangelog(null);
@@ -356,12 +471,19 @@
                 catch (_) {
                     setCurrentVersion(null);
                 }
-                const inProgress = localStorage.getItem("update_in_progress") === "true";
-                if (!inProgress || storedStatus !== "update_available") {
-                    localStorage.removeItem("update_in_progress");
-                    setIsUpdateLocked(false);
+                if (inProgress) {
+                    try {
+                        const progress = await applyProgressFromBackend();
+                        if (progress?.done) {
+                            await finishUpdateSuccess();
+                        }
+                        else if (progress?.failed) {
+                            clearUpdateProgress();
+                        }
+                    }
+                    catch (_) { }
                 }
-                if (storedAutoCheck)
+                if (storedAutoCheck && !inProgress)
                     onCheckUpdates();
             })();
         }, []);
@@ -370,15 +492,14 @@
                 return;
             const pollUpdateLog = async () => {
                 try {
-                    const result = await window.call("get_update_log", {});
-                    if (!result)
+                    const progress = await applyProgressFromBackend();
+                    if (!progress)
                         return;
-                    setLog(result);
-                    setUpdateProgress(parseUpdateStep(result));
-                    if (result.includes("ERROR:")) {
-                        setIsUpdating(false);
-                        setIsUpdateLocked(false);
-                        localStorage.removeItem("update_in_progress");
+                    if (progress.done) {
+                        await finishUpdateSuccess();
+                    }
+                    else if (progress.failed) {
+                        clearUpdateProgress();
                         serverAPI.toaster.toast({ title: "DeckyWARP", body: t$1("update_step_error") });
                     }
                 }
@@ -400,16 +521,24 @@
             setStatus(null);
             setLatestVersion(null);
             setChangelog(null);
+            setIsUpdating(false);
             setIsUpdateLocked(false);
             setAutoCheck(false);
             localStorage.setItem("auto_check", "false");
             setLog(prev => prev + `\n${t$1("update_ignored")} ${latestVersion} ${t$1("ignored")}`);
         };
         const onCheckUpdates = async () => {
+            if (checkingRef.current || isChecking)
+                return;
+            checkingRef.current = true;
             setIsChecking(true);
             setLog(prev => prev + `\n⏳ ${t$1("check")}...`);
             try {
                 const result = await window.call("check_update", {});
+                if (result.status === "checking") {
+                    setLog(prev => prev + `\n⏳ ${t$1("checking")}`);
+                    return;
+                }
                 const ignored = localStorage.getItem(IGNORED_KEY);
                 if (result.status === "update_available" && result.latest === ignored) {
                     setLog(prev => prev + `\n🔕 ${t$1("update_available")} ${result.latest} ${t$1("ignored")}`);
@@ -435,8 +564,9 @@
                 localStorage.setItem("update_current", result.current);
                 localStorage.setItem("update_changelog", result.changelog || "");
                 if (result.status !== "update_available") {
-                    localStorage.removeItem("update_in_progress");
-                    setIsUpdateLocked(false);
+                    if (localStorage.getItem("update_in_progress") !== "true") {
+                        setIsUpdateLocked(false);
+                    }
                 }
             }
             catch (e) {
@@ -447,15 +577,16 @@
                 localStorage.setItem("update_changelog", "");
             }
             finally {
+                checkingRef.current = false;
                 setIsChecking(false);
             }
         };
         const onUpdate = async () => {
             setIsUpdating(true);
             setIsUpdateLocked(true);
-            setUpdateProgress(t$1("update_step_fetch"));
+            setUpdateHasError(false);
             localStorage.setItem("update_in_progress", "true");
-            setLog(`${t$1("starting_update")}\n${t$1("update_progress_hint")}`);
+            setLog(t$1("starting_update"));
             serverAPI.toaster.toast({
                 title: "DeckyWARP",
                 body: `${t$1("update_toast_start")} ${latestVersion || ""}...`
@@ -463,7 +594,15 @@
             try {
                 const result = await window.call("update_plugin", {});
                 if (result?.status === "error") {
-                    setUpdateProgress(t$1("update_step_error"));
+                    let progress = null;
+                    try {
+                        progress = await applyProgressFromBackend();
+                    }
+                    catch (_) { }
+                    if (progress && !progress.failed && !progress.done) {
+                        return;
+                    }
+                    setUpdateHasError(true);
                     setLog(prev => `${prev}\n${t$1("update_launch_failed")} ${result.detail || ""}`);
                     setIsUpdating(false);
                     setIsUpdateLocked(false);
@@ -471,17 +610,10 @@
                     serverAPI.toaster.toast({ title: "DeckyWARP", body: t$1("update_step_error") });
                     return;
                 }
-                try {
-                    const logResult = await window.call("get_update_log", {});
-                    if (logResult) {
-                        setLog(logResult);
-                        setUpdateProgress(parseUpdateStep(logResult));
-                    }
-                }
-                catch (_) { }
+                await applyProgressFromBackend();
             }
             catch (e) {
-                setUpdateProgress(t$1("update_step_error"));
+                setUpdateHasError(true);
                 setLog(prev => `${prev}\n${t$1("error_during_update")}${e}`);
                 setIsUpdating(false);
                 setIsUpdateLocked(false);
@@ -490,7 +622,7 @@
         };
         const renderStatus = () => {
             if (isUpdating || isUpdateLocked)
-                return updateProgress || t$1("update_in_progress");
+                return t$1("installing");
             if (status === "error")
                 return t$1("check_error");
             if (status === "update_available" && latestVersion)
@@ -526,7 +658,11 @@
                                               status === "update_available" && (window.SP_REACT.createElement(deckyFrontendLib.PanelSectionRow, null,
                                                                                                               window.SP_REACT.createElement(CustomButtonItem, { onClick: resetUpdateState, disabled: isUpdating || isUpdateLocked }, t$1("ignore")))),
                                               (isUpdating || isUpdateLocked) && (window.SP_REACT.createElement(deckyFrontendLib.PanelSectionRow, null,
-                                                                                                               window.SP_REACT.createElement(CustomTextBox, { label: t$1("update_progress_label"), content: `${updateProgress || t$1("update_in_progress")}\n\n${log}` }))),
+                                                                                                               window.SP_REACT.createElement(UpdateProgressBar, { indeterminate: true, error: updateHasError }))),
+                                              isChecking && (window.SP_REACT.createElement(deckyFrontendLib.PanelSectionRow, null,
+                                                                                           window.SP_REACT.createElement(UpdateProgressBar, { indeterminate: true }))),
+                                              (isUpdating || isUpdateLocked) && debugMode && (window.SP_REACT.createElement(deckyFrontendLib.PanelSectionRow, null,
+                                                                                                               window.SP_REACT.createElement(CustomTextBox, { label: t$1("update_progress_label"), content: log }))),
                                               debugMode && !(isUpdating || isUpdateLocked) && (window.SP_REACT.createElement(deckyFrontendLib.PanelSectionRow, null,
                                                                                           window.SP_REACT.createElement(CustomTextBox, { label: t$1("log_label"), content: log }))),
                                               window.SP_REACT.createElement(deckyFrontendLib.ToggleField, { label: t$1("auto_check"), checked: autoCheck, onChange: handleAutoCheckToggle })));

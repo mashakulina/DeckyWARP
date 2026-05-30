@@ -310,6 +310,17 @@
                 try {
                     const result = await window.call("get_version", {});
                     setCurrentVersion(result.version);
+                    const storedLatestAfter = localStorage.getItem("update_latest");
+                    if (storedStatus === "update_available" &&
+                        storedLatestAfter &&
+                        result.version === storedLatestAfter) {
+                        setStatus("up_to_date");
+                        setLatestVersion(null);
+                        setChangelog(null);
+                        localStorage.setItem("update_status", "up_to_date");
+                        localStorage.removeItem("update_latest");
+                        localStorage.removeItem("update_changelog");
+                    }
                 }
                 catch (_) {
                     setCurrentVersion(null);

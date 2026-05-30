@@ -367,18 +367,46 @@ echo "== START UPDATE: $(date)"
 
 PLUGIN_DIR="/home/deck/homebrew/plugins/DeckyWARP"
 TMP_DIR="/tmp/deckywarp_update"
-ZIP_URL="https://api.github.com/repos/mashakulina/DeckyWARP/releases/latest"
+GITHUB_API_URL="https://api.github.com/repos/mashakulina/DeckyWARP/releases/latest"
+PLUGIN_JSON_PATH="/home/deck/homebrew/plugins/DeckyWARP/plugin.json"
+RELEASE_JSON="/tmp/deckywarp_release.json"
 
 mkdir -p "$TMP_DIR"
 cd "$TMP_DIR"
 
+fetch_release() {
+  curl -sf --connect-timeout 30 --retry 3 --retry-delay 2 \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'User-Agent: DeckyWARP-Update' \
+    "$GITHUB_API_URL" -o "$RELEASE_JSON"
+}
+
 echo "== FETCHING ASSET URL =="
-ASSET_URL=$(curl -s "$ZIP_URL" | grep '"zipball_url":' | cut -d '"' -f 4)
-[ -z "$ASSET_URL" ] && echo "ERROR: no asset url" && exit 1
+if ! fetch_release; then
+  echo "ERROR: failed to fetch release info from GitHub"
+  [ -f "$RELEASE_JSON" ] && echo "Response: $(cat "$RELEASE_JSON")"
+  exit 1
+fi
+
+LATEST=$(jq -r .tag_name "$RELEASE_JSON" | sed 's/^v//')
+CURRENT=$(jq -r .version "$PLUGIN_JSON_PATH")
+echo "Current: $CURRENT, Latest: $LATEST"
+
+if [ "$LATEST" = "$CURRENT" ]; then
+  echo "== ALREADY UP TO DATE: $CURRENT =="
+  exit 0
+fi
+
+ASSET_URL=$(jq -r .zipball_url "$RELEASE_JSON")
+if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+  echo "ERROR: no asset url"
+  echo "API response: $(cat "$RELEASE_JSON")"
+  exit 1
+fi
 echo "Asset URL: $ASSET_URL"
 
 echo "== DOWNLOADING ZIP =="
-curl -L -o latest.zip "$ASSET_URL"
+curl -fL --connect-timeout 45 --retry 3 --retry-delay 2 -o latest.zip "$ASSET_URL"
 [ ! -f latest.zip ] && echo "ERROR: download failed" && exit 1
 echo "Downloaded zip: $(du -h latest.zip)"
 
@@ -425,7 +453,10 @@ echo "== START CHECK: $(date)"
 GITHUB_API_URL="https://api.github.com/repos/mashakulina/DeckyWARP/releases/latest"
 PLUGIN_JSON_PATH="/home/deck/homebrew/plugins/DeckyWARP/plugin.json"
 
-curl -s -H 'Accept: application/vnd.github+json' "$GITHUB_API_URL" > /tmp/github_response.json
+curl -sf --connect-timeout 30 --retry 3 --retry-delay 2 \
+  -H 'Accept: application/vnd.github+json' \
+  -H 'User-Agent: DeckyWARP-Update' \
+  "$GITHUB_API_URL" > /tmp/github_response.json
 LATEST=$(jq -r .tag_name /tmp/github_response.json | sed 's/^v//')
 CURRENT=$(jq -r .version "$PLUGIN_JSON_PATH")
 
@@ -619,6 +650,25 @@ class Plugin:
                 return f"update_failed: {sudo_result.stderr[:100]}"
 
         return "update_started"
+
+    async def get_update_log(self):
+        if UPD_LOG.exists():
+            try:
+                return UPD_LOG.read_text().splitlines()[-1][-160:]
+            except Exception:
+                pass
+        return ""
+
+    async def get_version(self):
+        plugin_json = pathlib.Path("/home/deck/homebrew/plugins/DeckyWARP/plugin.json")
+        if plugin_json.exists():
+            try:
+                import json
+                data = json.loads(plugin_json.read_text())
+                return {"version": data.get("version", "unknown")}
+            except Exception:
+                pass
+        return {"version": "unknown"}
 
     # ---------- VERSION CHECK -------------------------------------------
 

@@ -86,6 +86,20 @@ const Updates = ({ serverAPI }: Props) => {
       try {
         const result = await (window as any).call("get_version", {});
         setCurrentVersion(result.version);
+
+        const storedLatest = localStorage.getItem("update_latest");
+        if (
+          storedStatus === "update_available" &&
+          storedLatest &&
+          result.version === storedLatest
+        ) {
+          setStatus("up_to_date");
+          setLatestVersion(null);
+          setChangelog(null);
+          localStorage.setItem("update_status", "up_to_date");
+          localStorage.removeItem("update_latest");
+          localStorage.removeItem("update_changelog");
+        }
       } catch (_) {
         setCurrentVersion(null);
       }

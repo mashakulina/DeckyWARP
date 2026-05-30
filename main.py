@@ -27,6 +27,7 @@ UPD_LOG = pathlib.Path("/tmp/deckywarp_update.log")
 UPD_UNIT = "deckywarp-update"
 
 CHK_FLAG = pathlib.Path("/tmp/.deckywarp_checking")
+CHK_LOCK = pathlib.Path("/tmp/deckywarp_check.lock")
 CHK_LOG = pathlib.Path("/tmp/deckywarp_check.log")
 CHK_UNIT = "deckywarp-check"
 
@@ -96,6 +97,100 @@ def _force_cleanup_update_flag():
         _cleanup_flag(UPD_FLAG, unit)
     if UPD_FLAG.exists() and _unit_state(UPD_UNIT) not in ("active", "activating"):
         UPD_FLAG.unlink(missing_ok=True)
+
+
+def _parse_check_log():
+    if not CHK_LOG.exists():
+        return None
+    try:
+        lines = CHK_LOG.read_text().splitlines()
+        for line in reversed(lines):
+            if line.startswith("update_available"):
+                parts = line.strip().split()
+                if len(parts) == 3:
+                    return {
+                        "status": "update_available",
+                        "latest": parts[1],
+                        "current": parts[2],
+                    }
+            elif line.startswith("up_to_date"):
+                parts = line.strip().split()
+                if len(parts) == 2:
+                    return {"status": "up_to_date", "current": parts[1]}
+            elif "ERROR:" in line:
+                return {"status": "error", "detail": line.strip()}
+        return None
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
+def _fetch_changelog():
+    import urllib.request
+    import ssl
+    import json
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        with urllib.request.urlopen(
+            "https://api.github.com/repos/mashakulina/DeckyWARP/releases/latest",
+            context=ctx,
+        ) as resp:
+            data = json.load(resp)
+            body = data.get("body", "")
+            lines = body.splitlines()
+
+        en_lines, ru_lines = [], []
+        mode = 0
+
+        for line in lines:
+            if line.strip().startswith("## **Changelog**"):
+                mode = 1
+                continue
+            elif line.strip().startswith("## **Список изменений**"):
+                mode = 2
+                continue
+            elif line.strip().startswith("#"):
+                mode = 0
+                continue
+
+            if mode == 1:
+                en_lines.append(line)
+            elif mode == 2:
+                ru_lines.append(line)
+
+        result = ""
+        if en_lines:
+            result += "== EN ==\n" + "\n".join(en_lines).strip() + "\n"
+        if ru_lines:
+            result += "\n== RU ==\n" + "\n".join(ru_lines).strip()
+        return result or "[changelog empty]"
+    except Exception as e:
+        return f"[changelog error] {e}"
+
+
+async def _wait_for_check_result(timeout=45):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        parsed = _parse_check_log()
+        if parsed:
+            if parsed["status"] == "update_available":
+                parsed["changelog"] = await asyncio.to_thread(_fetch_changelog)
+            return parsed
+
+        unit_state = _unit_state(CHK_UNIT)
+        if unit_state in ("inactive", "failed", "dead"):
+            parsed = _parse_check_log()
+            if parsed:
+                if parsed["status"] == "update_available":
+                    parsed["changelog"] = await asyncio.to_thread(_fetch_changelog)
+                return parsed
+            break
+
+        await asyncio.sleep(0.5)
+
+    return None
 
 # ── warp-cli state helpers ─────────────────────────────────────────────────
 def _state():
@@ -199,29 +294,81 @@ INSTALL_SH = r"""#!/bin/bash
 set -e
 exec > >(tee -a /tmp/warp_install.log) 2>&1
 echo "## start: $(date)"
+
+PACMAN_CONF_BAK="/tmp/pacman.conf.deckywarp.bak"
+PACMAN_RESTORED=0
+READONLY_ENABLED=0
+
+modify_pacman_conf() {
+  local action="$1"
+  echo "Изменяем pacman.conf ($action)..."
+  if [ "$action" = "enable" ]; then
+    sed -i 's/Required DatabaseOptional/TrustAll/g' /etc/pacman.conf
+    echo "Режим установки: TrustAll активирован в pacman.conf"
+  else
+    sed -i 's/TrustAll/Required DatabaseOptional/g' /etc/pacman.conf
+    echo "Required DatabaseOptional восстановлен в pacman.conf"
+  fi
+}
+
+restore_pacman_conf() {
+  if [ "$PACMAN_RESTORED" = 1 ]; then
+    return 0
+  fi
+  if [ -f "$PACMAN_CONF_BAK" ]; then
+    cp "$PACMAN_CONF_BAK" /etc/pacman.conf
+    echo "pacman.conf восстановлен из резервной копии"
+  else
+    modify_pacman_conf disable
+  fi
+  PACMAN_RESTORED=1
+}
+
+enable_readonly() {
+  if [ "$READONLY_ENABLED" = 1 ]; then
+    return 0
+  fi
+  echo "Включаем steamos-readonly..."
+  steamos-readonly enable || echo "warn: не удалось включить steamos-readonly"
+  READONLY_ENABLED=1
+}
+
+finalize_system() {
+  restore_pacman_conf
+  enable_readonly
+}
+trap finalize_system EXIT
+
 # Проверяем и удаляем блокировку базы данных pacman
 PACMAN_DB_LOCK="/usr/lib/holo/pacmandb/db.lck"
 if [ -f "$PACMAN_DB_LOCK" ]; then
     echo "Found pacman db lock file, removing..."
-    sudo rm -f "$PACMAN_DB_LOCK"
+    rm -f "$PACMAN_DB_LOCK"
     echo "Lock file removed."
 fi
+
 steamos-readonly status | grep -q disabled || echo y | steamos-readonly disable
 mount -o remount,rw /
-rm -rf /etc/pacman.d/gnupg
-install -dm700 /etc/pacman.d/gnupg
+
+cp /etc/pacman.conf "$PACMAN_CONF_BAK"
+modify_pacman_conf enable
+
+grep -q '\[chaotic-aur\]' /etc/pacman.conf || \
+  echo -e '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist' >> /etc/pacman.conf
+
+echo "Инициализируем ключи pacman..."
 pacman-key --init
 pacman-key --populate
-pacman -Sy --noconfirm base-devel fakeroot curl
 pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com
 pacman-key --lsign-key 3056513887B78AEB
 pacman -U --noconfirm \
   'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' \
   'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst'
-grep -q '\[chaotic-aur\]' /etc/pacman.conf || \
-  echo -e '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist' >> /etc/pacman.conf
 
+echo "Обновляем базу данных pacman..."
 pacman -Sy --noconfirm
+
+pacman -S --noconfirm --needed base-devel fakeroot curl
 
 download_pkg() {
   local dest="$1"
@@ -299,15 +446,45 @@ install_gcc_runtime() {
   return 1
 }
 
-# Chaotic cloudflare-warp-bin объявляет зависимость «libgcc» как отдельный пакет Arch.
-# На SteamOS/Holo такого пакета нет (рантайм в gcc-libs), pacman блокирует -S и -U.
-# Виртуальная зависимость: библиотеки уже на системе после gcc-libs; версия завышена под возможные «>=».
-LIBGCC_ASSUME=( --assume-installed libgcc=99.0-1 )
+# Chaotic cloudflare-warp-bin объявляет зависимости «libgcc» и «libstdc++» как отдельные пакеты Arch.
+# На SteamOS/Holo их нет (рантайм в gcc-libs); версии завышены под возможные «>=».
+WARP_ASSUME=(
+  --assume-installed libgcc=99.0-1
+  --assume-installed libstdc++=99.0-1
+)
+
+install_warp_pkg_file() {
+  local pkg="$1"
+  local label="$2"
+
+  pacman -Rdd --noconfirm cloudflare-warp-bin 2>/dev/null || true
+
+  echo "== cloudflare-warp-bin: pacman -U ${label} (assume-installed) =="
+  if pacman -U --noconfirm "${WARP_ASSUME[@]}" --overwrite='*' "$pkg"; then
+    return 0
+  fi
+
+  echo "== cloudflare-warp-bin: pacman -U ${label} (--nodeps) =="
+  if pacman -U --noconfirm --nodeps --overwrite='*' "$pkg"; then
+    return 0
+  fi
+
+  echo "== cloudflare-warp-bin: bsdtar + --dbonly ${label} =="
+  if command -v bsdtar >/dev/null 2>&1; then
+    bsdtar -xpf "$pkg" -C /
+    if pacman -U --noconfirm --dbonly --nodeps "$pkg"; then
+      return 0
+    fi
+    pacman -Q cloudflare-warp-bin >/dev/null 2>&1 && return 0
+  fi
+
+  return 1
+}
 
 # cloudflare-warp-bin: pacman, затем прямой .pkg по URL, затем индекс Chaotic.
 install_cloudflare_warp_bin() {
   echo "== cloudflare-warp-bin: pacman -S (с --assume-installed для SteamOS) =="
-  if pacman -S --noconfirm "${LIBGCC_ASSUME[@]}" cloudflare-warp-bin; then
+  if pacman -S --noconfirm "${WARP_ASSUME[@]}" cloudflare-warp-bin; then
     echo "cloudflare-warp-bin: установлен через pacman."
     return 0
   fi
@@ -316,13 +493,8 @@ install_cloudflare_warp_bin() {
   WARP_URL="$(pacman -Sp cloudflare-warp-bin 2>/dev/null | grep -m1 -E '^https?://' | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
   if [ -n "$WARP_URL" ]; then
     if download_pkg /tmp/cloudflare-warp-bin.pkg.tar.zst "$WARP_URL" \
-      && pacman -U --noconfirm "${LIBGCC_ASSUME[@]}" /tmp/cloudflare-warp-bin.pkg.tar.zst; then
+      && install_warp_pkg_file /tmp/cloudflare-warp-bin.pkg.tar.zst "pacman -Sp"; then
       echo "cloudflare-warp-bin: установлен из .pkg.tar.zst (pacman -Sp)."
-      return 0
-    fi
-    echo "warn: pacman -U с assume-installed не вышел, пробуем --nodeps для того же файла..."
-    if pacman -U --noconfirm --nodeps /tmp/cloudflare-warp-bin.pkg.tar.zst; then
-      echo "cloudflare-warp-bin: установлен из .pkg.tar.zst (--nodeps)."
       return 0
     fi
   fi
@@ -338,16 +510,10 @@ install_cloudflare_warp_bin() {
   fi
   LAST_URL="https://cdn-mirror.chaotic.cx/chaotic-aur/x86_64/${FPKG}"
   echo "Качаем: $LAST_URL"
-  if download_pkg "/tmp/${FPKG}" "$LAST_URL"; then
-    if pacman -U --noconfirm "${LIBGCC_ASSUME[@]}" "/tmp/${FPKG}"; then
-      echo "cloudflare-warp-bin: установлен с Chaotic CDN (--assume-installed)."
-      return 0
-    fi
-    echo "warn: пробуем --nodeps для скачанного пакета..."
-    if pacman -U --noconfirm --nodeps "/tmp/${FPKG}"; then
-      echo "cloudflare-warp-bin: установлен с Chaotic CDN (--nodeps)."
-      return 0
-    fi
+  if download_pkg "/tmp/${FPKG}" "$LAST_URL" \
+    && install_warp_pkg_file "/tmp/${FPKG}" "Chaotic CDN"; then
+    echo "cloudflare-warp-bin: установлен с Chaotic CDN."
+    return 0
   fi
 
   echo "ERROR: cloudflare-warp-bin: установка не удалась."
@@ -473,9 +639,19 @@ def _write_update_script():
 
 CHECK_SH = r"""#!/bin/bash
 LOG="/tmp/deckywarp_check.log"
-: > "$LOG"
+FLAG="/tmp/.deckywarp_checking"
+LOCK="/tmp/deckywarp_check.lock"
+
+exec 201>"$LOCK"
+if ! flock -n 201; then
+  echo "ERROR: another check is already running" >> "$LOG"
+  exit 1
+fi
+
 exec >> "$LOG" 2>&1
 set -e
+trap 'rm -f "$FLAG"' EXIT
+
 echo "== START CHECK: $(date)"
 
 GITHUB_API_URL="https://api.github.com/repos/mashakulina/DeckyWARP/releases/latest"
@@ -493,6 +669,8 @@ if [ "$LATEST" != "$CURRENT" ]; then
 else
   echo "up_to_date $CURRENT"
 fi
+
+echo "== CHECK DONE: $(date)"
 
 """
 

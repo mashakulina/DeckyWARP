@@ -269,9 +269,39 @@
             update_launched: ru$2 ? "✅ Обновление запущено. Плагин скоро перезапустится."
             : "✅ Update started. Plugin will restart soon.",
             error_during_update: ru$2 ? "❌ Ошибка при установке обновления:\n"
-            : "❌ Error during update:\n"
+            : "❌ Error during update:\n",
+            update_in_progress: ru$2
+            ? "Обновление выполняется, подождите..."
+            : "Update in progress, please wait...",
+            update_progress_hint: ru$2
+            ? "Скачивание и установка могут занять до минуты. Не закрывайте меню Quick Access — после завершения Decky Loader перезапустится автоматически."
+            : "Download and install may take up to a minute. Keep Quick Access open — Decky Loader will restart automatically when done.",
+            update_progress_label: ru$2 ? "Ход обновления" : "Update progress",
+            update_toast_start: ru$2 ? "Начинаем обновление до версии" : "Updating to version",
+            update_step_fetch: ru$2 ? "Получаем информацию о релизе..." : "Fetching release info...",
+            update_step_download: ru$2 ? "Скачиваем обновление..." : "Downloading update...",
+            update_step_install: ru$2 ? "Устанавливаем файлы..." : "Installing files...",
+            update_step_restart: ru$2 ? "Перезапускаем Decky Loader..." : "Restarting Decky Loader...",
+            update_step_done: ru$2 ? "Обновление завершено!" : "Update complete!",
+            update_step_error: ru$2 ? "Ошибка обновления" : "Update failed",
+            update_launch_failed: ru$2 ? "Не удалось запустить обновление:" : "Failed to start update:"
         };
         return dict[key] || key;
+    };
+    const parseUpdateStep = (log) => {
+        if (log.includes("ERROR:"))
+            return t$1("update_step_error");
+        if (log.includes("== DONE:") || log.includes("ALREADY UP TO DATE"))
+            return t$1("update_step_done");
+        if (log.includes("== RESTARTING DECKY =="))
+            return t$1("update_step_restart");
+        if (log.includes("== INSTALLING FILES ==") || log.includes("== COPYING PLUGIN ==") || log.includes("== UNZIPPING =="))
+            return t$1("update_step_install");
+        if (log.includes("== DOWNLOADING ZIP =="))
+            return t$1("update_step_download");
+        if (log.includes("== FETCHING ASSET URL ==") || log.includes("== START UPDATE:"))
+            return t$1("update_step_fetch");
+        return t$1("update_in_progress");
     };
     const Updates = ({ serverAPI }) => {
         const [autoCheck, setAutoCheck] = React.useState(false);
@@ -283,6 +313,7 @@
         const [debugMode, setDebugMode] = React.useState(false);
         const [isUpdating, setIsUpdating] = React.useState(false);
         const [isChecking, setIsChecking] = React.useState(false);
+        const [updateProgress, setUpdateProgress] = React.useState(null);
         const [isUpdateLocked, setIsUpdateLocked] = React.useState(localStorage.getItem("update_in_progress") === "true");
         const IGNORED_KEY = "update_ignored_version";
         React.useEffect(() => {
@@ -335,19 +366,28 @@
             })();
         }, []);
         React.useEffect(() => {
-            let interval = null;
-            if (debugMode || isUpdating || isUpdateLocked) {
-                interval = setInterval(async () => {
-                    try {
-                        const result = await window.call("get_update_log", {});
-                        if (result)
-                            setLog(prev => prev + "\n" + result);
+            if (!isUpdating && !isUpdateLocked)
+                return;
+            const pollUpdateLog = async () => {
+                try {
+                    const result = await window.call("get_update_log", {});
+                    if (!result)
+                        return;
+                    setLog(result);
+                    setUpdateProgress(parseUpdateStep(result));
+                    if (result.includes("ERROR:")) {
+                        setIsUpdating(false);
+                        setIsUpdateLocked(false);
+                        localStorage.removeItem("update_in_progress");
+                        serverAPI.toaster.toast({ title: "DeckyWARP", body: t$1("update_step_error") });
                     }
-                    catch (_) { }
-                }, 1000);
-            }
+                }
+                catch (_) { }
+            };
+            pollUpdateLog();
+            const interval = setInterval(pollUpdateLog, 1000);
             return () => clearInterval(interval);
-        }, [debugMode, isUpdating, isUpdateLocked]);
+        }, [isUpdating, isUpdateLocked, serverAPI]);
         const handleAutoCheckToggle = (value) => {
             setAutoCheck(value);
             localStorage.setItem("auto_check", value.toString());
@@ -413,22 +453,44 @@
         const onUpdate = async () => {
             setIsUpdating(true);
             setIsUpdateLocked(true);
+            setUpdateProgress(t$1("update_step_fetch"));
             localStorage.setItem("update_in_progress", "true");
-            setLog(prev => prev + `\n${t$1("starting_update")}`);
+            setLog(`${t$1("starting_update")}\n${t$1("update_progress_hint")}`);
+            serverAPI.toaster.toast({
+                title: "DeckyWARP",
+                body: `${t$1("update_toast_start")} ${latestVersion || ""}...`
+            });
             try {
-                await window.call("update_plugin", {});
-                setLog(prev => prev + `\n${t$1("update_launched")}`);
+                const result = await window.call("update_plugin", {});
+                if (result?.status === "error") {
+                    setUpdateProgress(t$1("update_step_error"));
+                    setLog(prev => `${prev}\n${t$1("update_launch_failed")} ${result.detail || ""}`);
+                    setIsUpdating(false);
+                    setIsUpdateLocked(false);
+                    localStorage.removeItem("update_in_progress");
+                    serverAPI.toaster.toast({ title: "DeckyWARP", body: t$1("update_step_error") });
+                    return;
+                }
+                try {
+                    const logResult = await window.call("get_update_log", {});
+                    if (logResult) {
+                        setLog(logResult);
+                        setUpdateProgress(parseUpdateStep(logResult));
+                    }
+                }
+                catch (_) { }
             }
             catch (e) {
-                setLog(prev => prev + `\n${t$1("error_during_update")}` + e);
-            }
-            finally {
+                setUpdateProgress(t$1("update_step_error"));
+                setLog(prev => `${prev}\n${t$1("error_during_update")}${e}`);
                 setIsUpdating(false);
-                localStorage.removeItem("update_in_progress");
                 setIsUpdateLocked(false);
+                localStorage.removeItem("update_in_progress");
             }
         };
         const renderStatus = () => {
+            if (isUpdating || isUpdateLocked)
+                return updateProgress || t$1("update_in_progress");
             if (status === "error")
                 return t$1("check_error");
             if (status === "update_available" && latestVersion)
@@ -462,8 +524,10 @@
                                               status === "update_available" && changelog && (window.SP_REACT.createElement(deckyFrontendLib.PanelSectionRow, null,
                                                                                                                            window.SP_REACT.createElement(CustomTextBox, { label: t$1("changelog"), content: changelog }))),
                                               status === "update_available" && (window.SP_REACT.createElement(deckyFrontendLib.PanelSectionRow, null,
-                                                                                                              window.SP_REACT.createElement(CustomButtonItem, { onClick: resetUpdateState, disabled: isUpdating }, t$1("ignore")))),
-                                              debugMode && (window.SP_REACT.createElement(deckyFrontendLib.PanelSectionRow, null,
+                                                                                                              window.SP_REACT.createElement(CustomButtonItem, { onClick: resetUpdateState, disabled: isUpdating || isUpdateLocked }, t$1("ignore")))),
+                                              (isUpdating || isUpdateLocked) && (window.SP_REACT.createElement(deckyFrontendLib.PanelSectionRow, null,
+                                                                                                               window.SP_REACT.createElement(CustomTextBox, { label: t$1("update_progress_label"), content: `${updateProgress || t$1("update_in_progress")}\n\n${log}` }))),
+                                              debugMode && !(isUpdating || isUpdateLocked) && (window.SP_REACT.createElement(deckyFrontendLib.PanelSectionRow, null,
                                                                                           window.SP_REACT.createElement(CustomTextBox, { label: t$1("log_label"), content: log }))),
                                               window.SP_REACT.createElement(deckyFrontendLib.ToggleField, { label: t$1("auto_check"), checked: autoCheck, onChange: handleAutoCheckToggle })));
     };

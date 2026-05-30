@@ -39,9 +39,37 @@ const t = (key: string) => {
     update_launched: ru ? "✅ Обновление запущено. Плагин скоро перезапустится."
                          : "✅ Update started. Plugin will restart soon.",
     error_during_update: ru ? "❌ Ошибка при установке обновления:\n"
-                             : "❌ Error during update:\n"
+                             : "❌ Error during update:\n",
+    update_in_progress: ru
+      ? "Обновление выполняется, подождите..."
+      : "Update in progress, please wait...",
+    update_progress_hint: ru
+      ? "Скачивание и установка могут занять до минуты. Не закрывайте меню Quick Access — после завершения Decky Loader перезапустится автоматически."
+      : "Download and install may take up to a minute. Keep Quick Access open — Decky Loader will restart automatically when done.",
+    update_progress_label: ru ? "Ход обновления" : "Update progress",
+    update_toast_start: ru ? "Начинаем обновление до версии" : "Updating to version",
+    update_step_fetch: ru ? "Получаем информацию о релизе..." : "Fetching release info...",
+    update_step_download: ru ? "Скачиваем обновление..." : "Downloading update...",
+    update_step_install: ru ? "Устанавливаем файлы..." : "Installing files...",
+    update_step_restart: ru ? "Перезапускаем Decky Loader..." : "Restarting Decky Loader...",
+    update_step_done: ru ? "Обновление завершено!" : "Update complete!",
+    update_step_error: ru ? "Ошибка обновления" : "Update failed",
+    update_launch_failed: ru ? "Не удалось запустить обновление:" : "Failed to start update:"
   };
   return dict[key] || key;
+};
+
+const parseUpdateStep = (log: string) => {
+  if (log.includes("ERROR:")) return t("update_step_error");
+  if (log.includes("== DONE:") || log.includes("ALREADY UP TO DATE"))
+    return t("update_step_done");
+  if (log.includes("== RESTARTING DECKY ==")) return t("update_step_restart");
+  if (log.includes("== INSTALLING FILES ==") || log.includes("== COPYING PLUGIN ==") || log.includes("== UNZIPPING =="))
+    return t("update_step_install");
+  if (log.includes("== DOWNLOADING ZIP ==")) return t("update_step_download");
+  if (log.includes("== FETCHING ASSET URL ==") || log.includes("== START UPDATE:"))
+    return t("update_step_fetch");
+  return t("update_in_progress");
 };
 
 const Updates = ({ serverAPI }: Props) => {
@@ -54,6 +82,7 @@ const Updates = ({ serverAPI }: Props) => {
   const [debugMode, setDebugMode] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
   const [isChecking, setIsChecking] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<string | null>(null);
   const [isUpdateLocked, setIsUpdateLocked] = useState(
     localStorage.getItem("update_in_progress") === "true"
   );
@@ -115,17 +144,29 @@ const Updates = ({ serverAPI }: Props) => {
   }, []);
 
   useEffect(() => {
-    let interval: any = null;
-    if (debugMode || isUpdating || isUpdateLocked) {
-      interval = setInterval(async () => {
-        try {
-          const result = await (window as any).call("get_update_log", {});
-          if (result) setLog(prev => prev + "\n" + result);
-        } catch (_) {}
-      }, 1000);
-    }
+    if (!isUpdating && !isUpdateLocked) return;
+
+    const pollUpdateLog = async () => {
+      try {
+        const result = await (window as any).call("get_update_log", {});
+        if (!result) return;
+
+        setLog(result);
+        setUpdateProgress(parseUpdateStep(result));
+
+        if (result.includes("ERROR:")) {
+          setIsUpdating(false);
+          setIsUpdateLocked(false);
+          localStorage.removeItem("update_in_progress");
+          serverAPI.toaster.toast({ title: "DeckyWARP", body: t("update_step_error") });
+        }
+      } catch (_) {}
+    };
+
+    pollUpdateLog();
+    const interval = setInterval(pollUpdateLog, 1000);
     return () => clearInterval(interval);
-  }, [debugMode, isUpdating, isUpdateLocked]);
+  }, [isUpdating, isUpdateLocked, serverAPI]);
 
   const handleAutoCheckToggle = (value: boolean) => {
     setAutoCheck(value);
@@ -199,21 +240,46 @@ const Updates = ({ serverAPI }: Props) => {
   const onUpdate = async () => {
     setIsUpdating(true);
     setIsUpdateLocked(true);
+    setUpdateProgress(t("update_step_fetch"));
     localStorage.setItem("update_in_progress", "true");
-    setLog(prev => prev + `\n${t("starting_update")}`);
+    setLog(`${t("starting_update")}\n${t("update_progress_hint")}`);
+
+    serverAPI.toaster.toast({
+      title: "DeckyWARP",
+      body: `${t("update_toast_start")} ${latestVersion || ""}...`
+    });
+
     try {
-      await (window as any).call("update_plugin", {});
-      setLog(prev => prev + `\n${t("update_launched")}`);
+      const result = await (window as any).call("update_plugin", {});
+
+      if (result?.status === "error") {
+        setUpdateProgress(t("update_step_error"));
+        setLog(prev => `${prev}\n${t("update_launch_failed")} ${result.detail || ""}`);
+        setIsUpdating(false);
+        setIsUpdateLocked(false);
+        localStorage.removeItem("update_in_progress");
+        serverAPI.toaster.toast({ title: "DeckyWARP", body: t("update_step_error") });
+        return;
+      }
+
+      try {
+        const logResult = await (window as any).call("get_update_log", {});
+        if (logResult) {
+          setLog(logResult);
+          setUpdateProgress(parseUpdateStep(logResult));
+        }
+      } catch (_) {}
     } catch (e) {
-      setLog(prev => prev + `\n${t("error_during_update")}` + e);
-    } finally {
+      setUpdateProgress(t("update_step_error"));
+      setLog(prev => `${prev}\n${t("error_during_update")}${e}`);
       setIsUpdating(false);
-      localStorage.removeItem("update_in_progress");
       setIsUpdateLocked(false);
+      localStorage.removeItem("update_in_progress");
     }
   };
 
   const renderStatus = () => {
+    if (isUpdating || isUpdateLocked) return updateProgress || t("update_in_progress");
     if (status === "error") return t("check_error");
     if (status === "update_available" && latestVersion)
       return `${t("update_available")} ${latestVersion}!`;
@@ -273,14 +339,23 @@ const Updates = ({ serverAPI }: Props) => {
         <PanelSectionRow>
           <CustomButtonItem
             onClick={resetUpdateState}
-            disabled={isUpdating}
+            disabled={isUpdating || isUpdateLocked}
           >
             {t("ignore")}
           </CustomButtonItem>
         </PanelSectionRow>
       )}
 
-      {debugMode && (
+      {(isUpdating || isUpdateLocked) && (
+        <PanelSectionRow>
+          <CustomTextBox
+            label={t("update_progress_label")}
+            content={`${updateProgress || t("update_in_progress")}\n\n${log}`}
+          />
+        </PanelSectionRow>
+      )}
+
+      {debugMode && !(isUpdating || isUpdateLocked) && (
         <PanelSectionRow>
           <CustomTextBox label={t("log_label")} content={log} />
         </PanelSectionRow>

@@ -22,6 +22,7 @@ TOS_DONE = pathlib.Path("/tmp/.warp_tos_done")
 
 # --- plugin update/check ---  ⬅️ new unified flags/units
 UPD_FLAG = pathlib.Path("/tmp/.deckywarp_updating")
+UPD_LOCK = pathlib.Path("/tmp/deckywarp_update.lock")
 UPD_LOG = pathlib.Path("/tmp/deckywarp_update.log")
 UPD_UNIT = "deckywarp-update"
 
@@ -74,12 +75,27 @@ def _raw_status():
 # ---------- generic flag helpers -------------------------------------------
 
 def _cleanup_flag(flag: pathlib.Path, unit_name: str):
-    if flag.exists() and _unit_state(unit_name) in ("inactive", "failed"):
+    if not flag.exists():
+        return
+    state = _unit_state(unit_name)
+    if state in ("inactive", "failed", "dead"):
         flag.unlink(missing_ok=True)
 
 
 def _busy(flag: pathlib.Path):
     return flag.exists()
+
+
+def _plugin_dir() -> pathlib.Path:
+    deck_home = os.environ.get("DECKY_USER_HOME", "/home/deck")
+    return pathlib.Path(deck_home) / "homebrew/plugins/DeckyWARP"
+
+
+def _force_cleanup_update_flag():
+    for unit in (UPD_UNIT, f"{UPD_UNIT}_sudo"):
+        _cleanup_flag(UPD_FLAG, unit)
+    if UPD_FLAG.exists() and _unit_state(UPD_UNIT) not in ("active", "activating"):
+        UPD_FLAG.unlink(missing_ok=True)
 
 # ── warp-cli state helpers ─────────────────────────────────────────────────
 def _state():
@@ -360,26 +376,42 @@ def _write_script():
 
 # ── update-script (plugin self‑update) ──────────────────────────────────────
 
-UPDATE_SH = r"""#!/bin/bash
-set -e
-exec > >(tee -a /tmp/deckywarp_update.log) 2>&1
-echo "== START UPDATE: $(date)"
-
-PLUGIN_DIR="/home/deck/homebrew/plugins/DeckyWARP"
+def _update_sh_content() -> str:
+    plugin_dir = _plugin_dir()
+    deck_user = os.environ.get("DECKY_USER", "deck")
+    return f"""#!/bin/bash
+LOG="{UPD_LOG}"
+FLAG="{UPD_FLAG}"
+LOCK="{UPD_LOCK}"
+PLUGIN_DIR="{plugin_dir}"
+DECK_USER="{deck_user}"
 TMP_DIR="/tmp/deckywarp_update"
 GITHUB_API_URL="https://api.github.com/repos/mashakulina/DeckyWARP/releases/latest"
-PLUGIN_JSON_PATH="/home/deck/homebrew/plugins/DeckyWARP/plugin.json"
+PLUGIN_JSON_PATH="{plugin_dir}/plugin.json"
 RELEASE_JSON="/tmp/deckywarp_release.json"
+
+exec 200>"$LOCK"
+if ! flock -n 200; then
+  echo "ERROR: another update is already running" >> "$LOG"
+  exit 1
+fi
+
+exec >> "$LOG" 2>&1
+set -e
+trap 'rm -f "$FLAG"' EXIT
+
+echo "== START UPDATE: $(date)"
+echo "Plugin dir: $PLUGIN_DIR"
 
 mkdir -p "$TMP_DIR"
 cd "$TMP_DIR"
 
-fetch_release() {
-  curl -sf --connect-timeout 30 --retry 3 --retry-delay 2 \
-    -H 'Accept: application/vnd.github+json' \
-    -H 'User-Agent: DeckyWARP-Update' \
+fetch_release() {{
+  curl -sf --connect-timeout 30 --retry 3 --retry-delay 2 \\
+    -H 'Accept: application/vnd.github+json' \\
+    -H 'User-Agent: DeckyWARP-Update' \\
     "$GITHUB_API_URL" -o "$RELEASE_JSON"
-}
+}}
 
 echo "== FETCHING ASSET URL =="
 if ! fetch_release; then
@@ -406,52 +438,48 @@ fi
 echo "Asset URL: $ASSET_URL"
 
 echo "== DOWNLOADING ZIP =="
-curl -fL --connect-timeout 45 --retry 3 --retry-delay 2 -o latest.zip "$ASSET_URL"
+curl -fsSL --connect-timeout 45 --retry 3 --retry-delay 2 -o latest.zip "$ASSET_URL"
 [ ! -f latest.zip ] && echo "ERROR: download failed" && exit 1
 echo "Downloaded zip: $(du -h latest.zip)"
 
 echo "== UNZIPPING =="
-unzip -qo latest.zip || { echo "ERROR: unzip failed"; exit 1; }
+unzip -qo latest.zip || {{ echo "ERROR: unzip failed"; exit 1; }}
 INNER_DIR=$(find . -maxdepth 1 -type d -name "*DeckyWARP*" | head -n 1)
 [ ! -d "$INNER_DIR" ] && echo "ERROR: inner dir not found" && exit 1
 echo "Found unpacked dir: $INNER_DIR"
 
-echo "== COPYING PLUGIN =="
-BACKUP="${PLUGIN_DIR}_backup_$(date +%s)"
-cp -r "$PLUGIN_DIR" "$BACKUP" || true
-rm -r "$PLUGIN_DIR"
-cp -r "$INNER_DIR" "$PLUGIN_DIR"
-COPY_RESULT=$?
+echo "== INSTALLING FILES =="
+mkdir -p "$PLUGIN_DIR"
+find "$PLUGIN_DIR" -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {{}} + 2>/dev/null || true
+cp -a "$INNER_DIR"/. "$PLUGIN_DIR"/
+chown -R "$DECK_USER:$DECK_USER" "$PLUGIN_DIR" 2>/dev/null || true
 
-if [ $COPY_RESULT -eq 0 ]; then
-  echo "== CLEANING BACKUP =="
-  rm -r "$BACKUP"
-  rm -r "$TMP_DIR"
-  echo "== RESTARTING DECKY =="
-  systemctl restart plugin_loader.service
-  echo "== DONE: $(date)"
-else
-  echo "ERROR: update copy failed"
-  exit 1
-fi
+echo "== CLEANING TEMP =="
+rm -rf "$TMP_DIR"
+
+echo "== RESTARTING DECKY =="
+systemctl restart plugin_loader.service
+echo "== DONE: $(date)"
 """
 
 
 def _write_update_script():
     path = pathlib.Path("/tmp/deckywarp_update.sh")
-    path.write_text(UPDATE_SH)
+    path.write_text(_update_sh_content())
     path.chmod(0o755)
     return str(path)
 
 # ── check-script (version check) ────────────────────────────────────────────
 
 CHECK_SH = r"""#!/bin/bash
+LOG="/tmp/deckywarp_check.log"
+: > "$LOG"
+exec >> "$LOG" 2>&1
 set -e
-exec > >(tee -a /tmp/deckywarp_check.log) 2>&1
 echo "== START CHECK: $(date)"
 
 GITHUB_API_URL="https://api.github.com/repos/mashakulina/DeckyWARP/releases/latest"
-PLUGIN_JSON_PATH="/home/deck/homebrew/plugins/DeckyWARP/plugin.json"
+PLUGIN_JSON_PATH="__PLUGIN_JSON__"
 
 curl -sf --connect-timeout 30 --retry 3 --retry-delay 2 \
   -H 'Accept: application/vnd.github+json' \
@@ -471,7 +499,8 @@ fi
 
 def _write_check_script():
     p = pathlib.Path("/tmp/deckywarp_check.sh")
-    p.write_text(CHECK_SH)
+    content = CHECK_SH.replace("__PLUGIN_JSON__", str(_plugin_dir() / "plugin.json"))
+    p.write_text(content)
     p.chmod(0o755)
     return str(p)
 
@@ -603,64 +632,77 @@ class Plugin:
     # ---------- PLUGIN UPDATE -------------------------------------------
 
     async def update_plugin(self):
-        """Запускает обновление плагина - по аналогии с установкой WARP"""
-        _cleanup_flag(UPD_FLAG, UPD_UNIT)
-        if _busy(UPD_FLAG):
-            return "updating"
+        """Запускает обновление плагина через systemd unit (переживает restart Decky)."""
+        _force_cleanup_update_flag()
 
-        UPD_FLAG.touch()
+        for unit in (UPD_UNIT, f"{UPD_UNIT}_sudo"):
+            if _unit_state(unit) in ("active", "activating"):
+                return {"status": "error", "detail": "Update already running"}
 
-        # Используем тот же подход, что и для установки WARP
+        try:
+            UPD_FLAG.open("x").close()
+        except FileExistsError:
+            _force_cleanup_update_flag()
+            if UPD_FLAG.exists():
+                return {"status": "error", "detail": "Update already running"}
+
+        script = _write_update_script()
+        UPD_LOG.write_text(f"== UPDATE REQUESTED: {time.ctime()} ==\n")
+
         await _run("systemctl", "reset-failed", f"{UPD_UNIT}.service")
+        await _run("systemctl", "stop", f"{UPD_UNIT}.service")
+        await _run("systemctl", "reset-failed", f"{UPD_UNIT}_sudo.service")
+        await _run("systemctl", "stop", f"{UPD_UNIT}_sudo.service")
 
+        unit = UPD_UNIT
+        cmd = ["systemd-run", "--unit", UPD_UNIT, "--service-type=oneshot", "/bin/bash", script]
         result = await asyncio.to_thread(
             subprocess.run,
-            [
-                "systemd-run",
-                "--unit", UPD_UNIT,
-                "--service-type=oneshot",
-                "--quiet",
-                _write_update_script(),
-            ],
+            cmd,
             capture_output=True,
             text=True,
+            env=_clean_env(),
         )
 
         if result.returncode != 0:
-            log_to_file(f"Failed to start update unit: {result.stderr}")
-            # Пробуем с sudo
-            sudo_result = await asyncio.to_thread(
+            unit = f"{UPD_UNIT}_sudo"
+            cmd = ["sudo", "systemd-run", "--unit", unit, "--service-type=oneshot", "/bin/bash", script]
+            await _run("systemctl", "reset-failed", f"{unit}.service")
+            await _run("systemctl", "stop", f"{unit}.service")
+            result = await asyncio.to_thread(
                 subprocess.run,
-                [
-                    "sudo",
-                    "systemd-run",
-                    "--unit", f"{UPD_UNIT}_sudo",
-                    "--service-type=oneshot",
-                    "--quiet",
-                    _write_update_script(),
-                ],
+                cmd,
                 capture_output=True,
                 text=True,
+                env=_clean_env(),
             )
 
-            if sudo_result.returncode == 0:
-                return "update_started_with_sudo"
-            else:
-                UPD_FLAG.unlink(missing_ok=True)
-                return f"update_failed: {sudo_result.stderr[:100]}"
+        if result.returncode != 0:
+            UPD_FLAG.unlink(missing_ok=True)
+            last_error = (result.stderr or result.stdout or "systemd-run failed").strip()
+            log_to_file(f"Update launch failed: {last_error}")
+            with UPD_LOG.open("a", encoding="utf-8") as f:
+                f.write(f"ERROR: launch failed: {last_error}\n")
+            return {"status": "error", "detail": last_error[:200]}
 
-        return "update_started"
+        await asyncio.sleep(0.5)
+        state = _unit_state(unit)
+        with UPD_LOG.open("a", encoding="utf-8") as f:
+            f.write(f"== LAUNCHED via {unit} (state={state}) ==\n")
+        log_to_file(f"Update started via {unit}, state={state}")
+        return {"status": "started", "detail": state}
 
     async def get_update_log(self):
         if UPD_LOG.exists():
             try:
-                return UPD_LOG.read_text().splitlines()[-1][-160:]
+                lines = UPD_LOG.read_text().splitlines()
+                return "\n".join(lines[-20:])
             except Exception:
                 pass
         return ""
 
     async def get_version(self):
-        plugin_json = pathlib.Path("/home/deck/homebrew/plugins/DeckyWARP/plugin.json")
+        plugin_json = _plugin_dir() / "plugin.json"
         if plugin_json.exists():
             try:
                 import json
